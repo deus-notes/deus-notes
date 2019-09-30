@@ -1,7 +1,0 @@
-Для того, чтобы изменить keymap на linux можно использовать след. комады:
-# setxkbmap -layout us,ru  // Устанавливаем us и ru разметку
-# setxkbmap -option 'grp:lctrl_lshift_toggle' // Устанавливаем переключение по Ctrl+Shift
-
-Не уверен, но возможно нужно еще в /etc/locale.gen раскоментить нужный locale и сделать
-locale-get команду
-Так же возможно нужно установить новую локаль в /etc/locale.conf
