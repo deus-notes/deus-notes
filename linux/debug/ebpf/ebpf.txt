@@ -57,3 +57,208 @@ Cпособы облегчить себе жизнь:
 1. Писать backend используя LLVM eBPF compiler
 2. Использовать bcc компилятор
 3. bpfftrace
+
+
+===============================================================================
+===============================================================================
+    Данная статья постарается ответить на вопросы, что такое eBPF, для чего оно используется и как писать
+eBPF программы
+
+    eBPF, он же extended Berkeley Packet Filter, используется для того, чтобы создавать свои программы, которые
+будут вызываться ядром при происхождении какого-то ивента. В отличии от обычный ядерных модулей eBPF имеет
+одно весомое преимущество - программы eBPF безопасны, они не могут навредить системе, поскольку проходят
+процедуру верификации в момент их загрузки в систему. Верификатор проверяет, что программа не содержит
+бесконечных циклов, доступу к invalid memory, контролирует кол-во инструкций в программе и т.п.
+
+    По сути, eBPF - это вируальная машина в ядре, которая исполняет некий байт-код, который был передан ей из 
+юзерспейса. Данный байт-код и называется eBPF программой.
+
+Для чего используется eBPF:
+    eBPF имеет невераятный спектр возможностей, как например: контроль сетевого трафика, трассировка ядра, фаерволл
+и многое другое. В данной статье мы рассмотрим eBPF как очень мощьный инструмент трассировки ядра, который
+может "подцепится" на множество видов ивентов, таких как сисколлы, сетевая активность. получить необходимую
+информацию и передать ее пользователю в userspace.
+    Например, типичный пример eBPF программы из семплов ядра (samples/bpf/sock_example.*) позволяет подсчитать 
+количество IPv4, IPv6 и ICMP пакетов полученных на loopback интерфейс. Но не одной сетью едины, такой же фокус
+можно сделать для сисколов.
+    В зависимости от выбраного типа eBPF программы пользователь может получить доступ к разным подсистемам ядра.
+Для трассировки системных вызовов используются kprobe/kretprobe/tracepints/uprobe. Для фильтрации сетевого трафика
+используются xdp и tc.
+
+    eBPF программа состоит из слудеющих компонентов:
+1. backend часть - байт-код, который работает в виртуальном пространстве в ядре. В ядре проходит верификация
+байт-кода и его последующая компиляция в нативный код при помощи JIT компилятора. Данный нативный код и будет
+использываться в виртуалке.
+2. loader - загрузчик байт-кода, он передает код программы на верификацию. Обычно, время жизни загрузчика 
+равно времени жизни самой backend программы, поскольку последняя завершается после смерти загрузчика.
+3. frontend - userspace часть eBPF программы, которая ответственна за получение данных из ядра через data structures.
+В классическом варианте она написана на С.
+4. data structures - Некий механизм, который используется чтобы предоставить канал коммуникации между
+backend и frontend. Это может быть кольцевой буфер или специальная BPF map.
+
+    Backend части хотелось уделить повышенное внимание. eBPF программа, работающая в виртуальной машине имеет
+в своем распоряжении 11 регистров (r0-r10). Регистр r0 используется для возвращаемого значения eBPF функции.
+Регистры r1-r5 используются для аргументов, передающихся в функцию. r6-r10 могут быть использованны для личного
+пользования, при этом r10 является 500кб стеком программы.
+
+Цикл запуска eBPF программы для трассировки:
+1. Userspace отправляет bytecode в ядро, так же передавая тип программы, чтобы ядро могло понять, 
+какие области должны быть доступны
+2. Ядро запускает верификатор eBPF программ, который проверяет что программа безопасна kernel/bpf/verifier.c
+3. JIT компилирует bytecode в nativecode и вставляет его в нужное место
+4. Программа пишет инфу в кольцевой буффер или в мапу
+5. Userspace читает результат и выводит пользователю
+
+Как выглядит типичная eBPF программа на примере уже известного нам sock_example:
+Спойлер: Данный пример использует самый базовый и сложный способ написания backend для eBPF, не пугайтесь.
+Следующие способы не будут напрямую использовать byte-code
+
+/* eBPF example program:
+ * - creates arraymap in kernel with key 4 bytes and value 8 bytes
+ *
+ * - loads eBPF program:
+ *   r0 = skb->data[ETH_HLEN + offsetof(struct iphdr, protocol)];
+ *   *(u32*)(fp - 4) = r0;
+ *   // assuming packet is IPv4, lookup ip->proto in a map
+ *   value = bpf_map_lookup_elem(map_fd, fp - 4);
+ *   if (value)
+ *        (*(u64*)value) += 1;
+ *
+ * - attaches this program to loopback interface "lo" raw socket
+ *
+ * - every second user space reads map[tcp], map[udp], map[icmp] to see
+ *   how many packets of given protocol were seen on "lo"
+ */
+#include <stdio.h>
+#include <unistd.h>
+#include <assert.h>
+#include <linux/bpf.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <linux/if_ether.h>
+#include <linux/types.h>
+#include <linux/ip.h>
+#include <stddef.h>
+#include <bpf/bpf.h>
+#include "bpf_insn.h"
+#include "sock_example.h"
+
+char bpf_log_buf[BPF_LOG_BUF_SIZE];
+
+static int test_sock(void)
+{
+	int sock = -1, map_fd, prog_fd, i, key;
+	long long value = 0, tcp_cnt, udp_cnt, icmp_cnt;
+
+	map_fd = bpf_create_map(BPF_MAP_TYPE_ARRAY, sizeof(key), sizeof(value),
+				256, 0);
+	if (map_fd < 0) {
+		printf("failed to create map '%s'\n", strerror(errno));
+		goto cleanup;
+	}
+
+	struct bpf_insn prog[] = {
+		BPF_MOV64_REG(BPF_REG_6, BPF_REG_1), //переместить pointer из r1 в r6
+		BPF_LD_ABS(BPF_B, ETH_HLEN + offsetof(struct iphdr, protocol) /* R0 = ip->proto */),
+		BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, -4), /* *(u32 *)(fp - 4) = r0 */
+		BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
+		BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -4), /* r2 = fp - 4 */
+		BPF_LD_MAP_FD(BPF_REG_1, map_fd),
+		BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem), //Поиск ключа в карте и сохранение указателя на значение в r0
+		BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 2), //Проверка успешности поиска в мапе, если нет - пропустить 2 инструкции
+		BPF_MOV64_IMM(BPF_REG_1, 1), /* r1 = 1 */
+		BPF_RAW_INSN(BPF_STX | BPF_XADD | BPF_DW, BPF_REG_0, BPF_REG_1, 0, 0), /* xadd r0 += r1 */
+		BPF_MOV64_IMM(BPF_REG_0, 0), /* r0 = 0 */
+		BPF_EXIT_INSN(),
+	};
+	size_t insns_cnt = sizeof(prog) / sizeof(struct bpf_insn);
+
+	prog_fd = bpf_load_program(BPF_PROG_TYPE_SOCKET_FILTER, prog, insns_cnt,
+				   "GPL", 0, bpf_log_buf, BPF_LOG_BUF_SIZE);
+	if (prog_fd < 0) {
+		printf("failed to load prog '%s'\n", strerror(errno));
+		goto cleanup;
+	}
+
+	sock = open_raw_sock("lo");
+
+	if (setsockopt(sock, SOL_SOCKET, SO_ATTACH_BPF, &prog_fd,
+		       sizeof(prog_fd)) < 0) {
+		printf("setsockopt %s\n", strerror(errno));
+		goto cleanup;
+	}
+
+	for (i = 0; i < 10; i++) {
+		key = IPPROTO_TCP;
+		assert(bpf_map_lookup_elem(map_fd, &key, &tcp_cnt) == 0);
+
+		key = IPPROTO_UDP;
+		assert(bpf_map_lookup_elem(map_fd, &key, &udp_cnt) == 0);
+
+		key = IPPROTO_ICMP;
+		assert(bpf_map_lookup_elem(map_fd, &key, &icmp_cnt) == 0);
+
+		printf("TCP %lld UDP %lld ICMP %lld packets\n",
+		       tcp_cnt, udp_cnt, icmp_cnt);
+		sleep(1);
+	}
+
+cleanup:
+	/* maps, programs, raw sockets will auto cleanup on process exit */
+	return 0;
+}
+
+int main(void)
+{
+	FILE *f;
+
+	f = popen("ping -4 -c5 localhost", "r");
+	(void)f;
+
+	return test_sock();
+}
+
+Из кода можно выделить 4 основных действия:
+1. Создание data structures, то есть BPF_MAP, которая будет использоватся для передачи данных между
+пространствамми. Для этого используется функция bpf_create_map, где 1 аргумент - тип мапы (все типы мапы можно
+посмотреть тут https://github.com/torvalds/linux/blob/v5.2/include/uapi/linux/bpf.h#L114) и последующие передают
+размер key/value.
+2. Написание backend байткода. Мы заполняем массив bpf_insn стуктур, используя макросы, которые предоставляет
+нам libbpf (https://github.com/torvalds/linux/blob/v4.20/samples/bpf/bpf_insn.h). Именно этот код будет работать
+у нас в ядре.
+3. Загрузка программы, используя функцию из libbpf bpf_load_program.
+4. Чтение данных из BPF_MAP
+
+    Однако написание байт-кода в более сложных программах вполне может отпугнуть разработчиков. Поэтому
+для облегчения жизни был придуман другой способ написания eBPF backend
+Можно писать eBPF backend на restricted C, после чего компилировать с использование llvm.
+Плюсы данного способа в том, что мы очень облегчим разработку и читаемость ядерной части программы, а так же
+в том, что реализация data structures и backend будут определятся в отдельном от frontend и loader файле.
+Тот же sock_example, только с использование C для backend:
+
+struct bpf_map_def SEC("maps") my_map = { //инициализация BPF_MAP, аналогична байткоду
+	.type = BPF_MAP_TYPE_ARRAY,
+	.key_size = sizeof(u32),
+	.value_size = sizeof(long),
+	.max_entries = 256,
+};
+
+SEC("socket1")
+int bpf_prog1(struct __sk_buff *skb)
+{
+	int index = load_byte(skb, ETH_HLEN + offsetof(struct iphdr, protocol)); // index = (uint8_t)iphdr->protocol
+	long *value;
+
+	if (skb->pkt_type != PACKET_OUTGOING)
+		return 0;
+
+	value = bpf_map_lookup_elem(&my_map, &index); // поиск по ключу в мапе
+	if (value)
+		__sync_fetch_and_add(value, skb->len);
+
+	return 0;
+}
+
